@@ -659,3 +659,341 @@ async function init() {
 }
 
 init().catch(err => { console.error('[app] Init failed:', err); showToast('鈿狅笍 鍒濆鍖栧け璐ワ紝璇峰埛鏂伴〉闈�'); });
+/* 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺�
+   app.js 鈥� Main entry point
+   鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺� */
+
+import { genId, parseLocalDeadline } from './utils.js';
+import { createTask, createBrand, createContractClause } from './models.js';
+import { openDB, loadTasks, saveTask, deleteTask, migrateFromLocalStorage, loadBrands, saveBrand, deleteBrand, loadContracts, saveContract, deleteContract } from './db.js';
+import { getApiKey, saveApiKey, parseTasksWithAI, askContractAI } from './ai.js';
+import { getRemindInterval, getFeishuWebhookUrl, setFeishuWebhookUrl, setRemindInterval, initNotifications, requestNotificationPermission, startReminderChecker, loadSettings } from './notifications.js';
+import { showToast, showProcessing, updateStats, updateFilterBrands, renderTasks, showTaskDetail, renderBrandList, showBrandDetail, renderContractList, renderAIChat, createReminderFile, updateHeaderDate, initTheme, toggleTheme, setUndoCallback } from './ui.js';
+import { navigate, onViewChange, initRouter, getCurrentView } from './router.js';
+
+let tasks = [], brands = [], contracts = [];
+let currentTab = 'pending', currentFilter = 'all', searchQuery = '', chatMessages = [], undoTask = null;
+
+window._createReminderFile = (id) => { const t = tasks.find(t => t.id === id); if (t) createReminderFile(t); };
+window._importSeedData = async () => {
+  document.getElementById('settingsOverlay').classList.remove('show');
+  await importSeedData();
+};
+
+async function toggleTask(id) {
+  const t = tasks.find(t => t.id === id); if (!t) return;
+  const wasDone = (t.status || t.鐘舵€�) === '宸插畬鎴�';
+  t.status = wasDone ? '鏈鐞�' : '宸插畬鎴�';
+  if (t.status === '宸插畬鎴�') { t.completedAt = new Date().toISOString(); t.lastReminded = null; }
+  else t.completedAt = null;
+  await saveTask(t); await refreshAll();
+  showToast(t.status === '宸插畬鎴�' ? '鉁� 宸插畬鎴�' : '馃攧 宸叉仮澶�');
+}
+
+async function deleteWithUndo(id) {
+  const t = tasks.find(t => t.id === id); if (!t) return;
+  undoTask = t; await deleteTask(id); await refreshAll(); showToast('馃棏 宸插垹闄�', true);
+}
+
+async function undoDelete() {
+  if (!undoTask) return;
+  await saveTask(undoTask); undoTask = null; await refreshAll(); showToast('鈫� 宸叉仮澶�');
+}
+
+async function addTaskFromData(taskData) {
+  if (!taskData.deadline && taskData.rawMessage) taskData.deadline = parseLocalDeadline(taskData.rawMessage);
+  const task = createTask({ id: genId(), ...taskData });
+  await saveTask(task);
+}
+
+async function processAndAddTasks(text) {
+  showProcessing(true, 'AI 姝ｅ湪鍒嗘瀽浠诲姟...');
+  try {
+    const tl = await parseTasksWithAI(text);
+    if (tl && tl.length > 0) { for (const t of tl) await addTaskFromData(t); showToast('鉁� 宸叉坊鍔� ' + tl.length + ' 涓换鍔�'); }
+    else showToast('鈿狅笍 鏈兘鎻愬彇鍒颁换鍔�');
+  } catch (err) { showToast('鉂� ' + err.message); }
+  finally { showProcessing(false); }
+  await refreshAll();
+}
+
+async function askAIAboutContracts(question) {
+  if (!contracts.length) { showToast('鈿狅笍 璇峰厛娣诲姞鍚堝悓鏉℃'); return; }
+  showProcessing(true, 'AI 姝ｅ湪鏌ヨ鍚堝悓鏉℃...');
+  try {
+    const context = contracts.map(c => { const brand = brands.find(b => b.id === c.brandId); return `銆�${c.brandName || (brand ? brand.name : '')} - ${c.title}銆慭n${c.content}`; }).join('\n\n');
+    const answer = await askContractAI(question, context);
+    chatMessages.push({ role: 'user', content: question }); chatMessages.push({ role: 'ai', content: answer });
+    renderAIChat(chatMessages);
+  } catch (err) { showToast('鉂� ' + err.message); }
+  finally { showProcessing(false); }
+}
+
+async function refreshAll() {
+  tasks = await loadTasks(); brands = await loadBrands(); contracts = await loadContracts();
+  updateStats(tasks); updateFilterBrands(tasks, setFilter);
+  const view = getCurrentView();
+  if (view === 'tasks') renderTasks(tasks, { tab: currentTab, filter: currentFilter, query: searchQuery, onToggle: toggleTask, onDelete: deleteWithUndo, onDetail: showDetail });
+  else if (view === 'brands') renderBrandList(brands, showBrandDetailView);
+  else if (view === 'contracts') renderContractList(contracts, brands, { onContractClick: showContractDetail });
+  const pendingCount = tasks.filter(t => (t.status || t.鐘舵€�) !== '宸插畬鎴�').length;
+  const badge = document.getElementById('navPendingBadge');
+  if (badge) { badge.textContent = pendingCount; badge.style.display = pendingCount > 0 ? '' : 'none'; }
+}
+
+function setFilter(brand) { currentFilter = brand; refreshAll(); }
+
+function setTab(tab) {
+  currentTab = tab;
+  document.querySelectorAll('#tabs .tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+  refreshAll();
+}
+
+function showDetail(id) { const t = tasks.find(t => t.id === id); if (t) showTaskDetail(t, toggleTask); }
+
+function showBrandDetailView(id) {
+  const b = brands.find(b => b.id === id);
+  if (b) showBrandDetail(b, tasks, contracts, { onClose: () => {} });
+}
+
+function showContractDetail(id) {
+  const c = contracts.find(c => c.id === id); if (!c) return;
+  const sheet = document.getElementById('detailSheet'), overlay = document.getElementById('detailOverlay');
+  if (!sheet || !overlay) return;
+  const brand = brands.find(b => b.id === c.brandId);
+  sheet.innerHTML = `<h2>馃摐 ${c.title}</h2><div style="background:var(--bg);border-radius:var(--radius-sm);padding:14px;margin-bottom:12px;white-space:pre-wrap;line-height:1.6;font-size:14px">${c.content}</div><div class="clause-meta"><span class="tag tag-info">${c.brandName || (brand ? brand.name : '閫氱敤')}</span><span class="tag tag-default">${c.category}</span>${c.tags && c.tags.length ? c.tags.map(tg => '<span class="tag tag-warning">' + tg + '</span>').join('') : ''}${c.sourceDoc ? '<span>馃搫 ' + c.sourceDoc + '</span>' : ''}<span>馃搮 ${new Date(c.createdAt).toLocaleDateString('zh-CN')}</span></div><div class="modal-actions" style="margin-top:16px"><button class="btn-cancel" id="contractDetailClose">鍏抽棴</button><button class="btn-danger" id="contractDetailDelete">馃棏 鍒犻櫎</button></div>`;
+  document.getElementById('contractDetailClose').onclick = () => overlay.classList.remove('show');
+  document.getElementById('contractDetailDelete').onclick = async () => { await deleteContract(id); overlay.classList.remove('show'); await refreshAll(); showToast('馃棏 鏉℃宸插垹闄�'); };
+  overlay.classList.add('show');
+}
+
+function handleViewChange(view) {
+  document.querySelectorAll('.modal-overlay').forEach(o => o.classList.remove('show'));
+  const searchBar = document.getElementById('searchBar'), tabs = document.getElementById('tabs'), filterBar = document.getElementById('filterBar');
+  const taskList = document.getElementById('taskList'), brandList = document.getElementById('brandListContainer');
+  const contractList = document.getElementById('contractListContainer'), chatContainer = document.getElementById('chatContainer');
+  const showTasks = view === 'tasks';
+  if (searchBar) searchBar.style.display = showTasks ? '' : 'none';
+  if (tabs) tabs.style.display = showTasks ? '' : 'none';
+  if (filterBar) filterBar.style.display = showTasks ? '' : 'none';
+  if (taskList) taskList.style.display = showTasks ? '' : 'none';
+  if (brandList) brandList.style.display = view === 'brands' ? '' : 'none';
+  if (contractList) contractList.style.display = view === 'contracts' ? '' : 'none';
+  if (chatContainer) chatContainer.style.display = view === 'chat' ? '' : 'none';
+  const fab = document.getElementById('fab');
+  if (fab) { fab.textContent = view === 'brands' ? '馃彚' : view === 'contracts' ? '馃摐' : '+'; }
+  refreshAll();
+}
+
+function exportTasks() {
+  const data = { tasks, brands, contracts, exportedAt: new Date().toISOString() };
+  const json = JSON.stringify(data, null, 2), blob = new Blob([json], { type: 'application/json' });
+  const url = URL.createObjectURL(blob), a = document.createElement('a');
+  a.href = url; a.download = 'ccmall-backup-' + new Date().toISOString().slice(0, 10) + '.json';
+  a.click(); URL.revokeObjectURL(url);
+  showToast('馃摛 宸插鍑� ' + tasks.length + '鏉′换鍔� + ' + brands.length + '鍝佺墝 + ' + contracts.length + '鏉℃');
+}
+
+async function importTasks(file) {
+  try {
+    const text = await file.text(), imported = JSON.parse(text);
+    const impTasks = Array.isArray(imported) ? imported : (imported.tasks || []);
+    const impBrands = imported.brands || [], impContracts = imported.contracts || [];
+    const eT = new Set(tasks.map(t => t.id)), eB = new Set(brands.map(b => b.id)), eC = new Set(contracts.map(c => c.id));
+    let aT = 0, aB = 0, aC = 0;
+    for (const t of impTasks) { if (!t.id || eT.has(t.id)) continue; await saveTask(t); eT.add(t.id); aT++; }
+    for (const b of impBrands) { if (!b.id || eB.has(b.id)) continue; await saveBrand(b); eB.add(b.id); aB++; }
+    for (const ct of impContracts) { if (!ct.id || eC.has(ct.id)) continue; await saveContract(ct); eC.add(ct.id); aC++; }
+    await refreshAll(); showToast('馃摜 瀵煎叆锛氫换鍔�+' + aT + ' 鍝佺墝+' + aB + ' 鏉℃+' + aC);
+  } catch (err) { showToast('鉂� 鏍煎紡閿欒'); }
+}
+
+async function importSeedData() {
+  showProcessing(true, '姝ｅ湪涓嬭浇鍚堝悓鏁版嵁...');
+  try {
+    const url = 'https://raw.githubusercontent.com/carsonw12/ccmall-tasks/main/seed-brands.json';
+    const resp = await fetch(url, { cache: 'no-cache' });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const text = await resp.text();
+    if (!text || text.length < 100) throw new Error('鏁版嵁涓虹┖');
+    let SEED_BRANDS;
+    try { SEED_BRANDS = JSON.parse(text); }
+    catch (e) { throw new Error('JSON瑙ｆ瀽澶辫触: ' + e.message.slice(0, 50)); }
+    const existingIds = new Set(brands.map(b => b.name));
+    let addedBrands = 0, addedClauses = 0;
+
+    for (const seed of SEED_BRANDS) {
+      // Add brand if not exists
+      if (!existingIds.has(seed.name)) {
+        const brand = createBrand({
+          id: genId(),
+          name: seed.name,
+          floor: seed.floor,
+          category: seed.category,
+          area: seed.area,
+          monthlyRent: seed.rentPerSqm ? seed.rentPerSqm * seed.area : 0,
+          leaseStart: seed.contractStart || null,
+          leaseEnd: seed.contractEnd || null,
+          contacts: seed.contactPerson ? [{ name: seed.contactPerson, phone: seed.contactPhone, role: '绛剧害浜�' }] : [],
+          notes: [
+            seed.type === '鑱旇惀' ? `鑱旇惀鍚堝悓 ${seed.contractNo} 路 鎵ｇ巼${seed.commissionRate}` : `绉熻祦鍚堝悓 路 楼${seed.rentPerSqm}/銕�/鏈坄,
+            seed.salesTarget ? `閿€鍞换鍔� ${seed.salesTarget}涓嘸 : '',
+            seed.supplierName ? `渚涘簲鍟�: ${seed.supplierName}` : '',
+            seed.shopNo ? `閾轰綅: ${seed.shopNo}` : '',
+            seed.notes && seed.notes !== '0' ? seed.notes : '',
+          ].filter(Boolean).join('\n'),
+        });
+        await saveBrand(brand);
+        existingIds.add(seed.name);
+        addedBrands++;
+      }
+
+      // Extract contract clauses
+      if (seed.clauses && seed.clauses.length > 0) {
+        for (const clause of seed.clauses) {
+          await saveContract(createContractClause({
+            id: genId(),
+            brandId: '',
+            brandName: seed.name,
+            title: seed.name + '鍚堝悓鏉℃',
+            content: clause,
+            category: seed.type === '鑱旇惀' ? '绉熼噾' : '绉熼噾',
+            tags: [seed.type, seed.category],
+            sourceDoc: seed.contractNo || seed.name + '鍚堝悓',
+          }));
+          addedClauses++;
+        }
+      }
+
+      // Add key contract note as clause if it has meaningful content
+      if (seed.notes && seed.notes !== '0' && seed.notes.length > 10 && seed.clauses.length === 0) {
+        await saveContract(createContractClause({
+          id: genId(),
+          brandId: '',
+          brandName: seed.name,
+          title: seed.name + '鍚堝悓澶囨敞',
+          content: seed.notes,
+          category: '鍏朵粬',
+          tags: [seed.type],
+          sourceDoc: seed.contractNo || seed.name + '鍚堝悓',
+        }));
+        addedClauses++;
+      }
+    }
+
+    await refreshAll();
+    showToast('馃搵 瀵煎叆鍝佺墝脳' + addedBrands + ' + 鏉℃脳' + addedClauses);
+  } catch (err) {
+    console.error(err);
+    showToast('鉂� 瀵煎叆澶辫触: ' + err.message);
+  } finally {
+    showProcessing(false);
+  }
+}
+
+async function checkSharedContent() {
+  const params = new URLSearchParams(window.location.search), text = params.get('text');
+  if (text) { window.history.replaceState({}, '', window.location.pathname); await processAndAddTasks(decodeURIComponent(text)); }
+}
+
+// 鈹€鈹€鈹€ Event Bindings 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+function bindEvents() {
+  const fab = document.getElementById('fab');
+  fab.onclick = () => {
+    const view = getCurrentView();
+    if (view === 'tasks') { document.getElementById('modalOverlay').classList.add('show'); document.getElementById('taskInput').focus(); }
+    else if (view === 'brands') document.getElementById('brandModal').classList.add('show');
+    else if (view === 'contracts') document.getElementById('contractModal').classList.add('show');
+  };
+
+  document.getElementById('btnCancel').onclick = () => { document.getElementById('modalOverlay').classList.remove('show'); document.getElementById('taskInput').value = ''; };
+  document.getElementById('btnSubmit').onclick = async () => { const text = document.getElementById('taskInput').value.trim(); if (!text) return; document.getElementById('modalOverlay').classList.remove('show'); document.getElementById('taskInput').value = ''; await processAndAddTasks(text); };
+  document.querySelectorAll('#tabs .tab').forEach(tab => { tab.onclick = () => setTab(tab.dataset.tab); });
+  document.querySelectorAll('#filterBar .filter-chip').forEach(chip => { chip.onclick = () => { document.querySelectorAll('#filterBar .filter-chip').forEach(c => c.classList.remove('active')); chip.classList.add('active'); setFilter(chip.dataset.filter); }; });
+
+  const searchInput = document.getElementById('searchInput'), searchClear = document.getElementById('searchClear');
+  searchInput.addEventListener('input', () => { searchQuery = searchInput.value.trim(); searchClear.classList.toggle('visible', searchQuery.length > 0); refreshAll(); });
+  searchClear.onclick = () => { searchInput.value = ''; searchQuery = ''; searchClear.classList.remove('visible'); refreshAll(); };
+
+  document.getElementById('btnSettings').onclick = () => {
+    document.getElementById('apiKeyInput').value = getApiKey();
+    document.getElementById('feishuWebhookInput').value = getFeishuWebhookUrl();
+    document.getElementById('remindSetting').value = getRemindInterval() || 'off';
+    document.getElementById('themeToggleBtn').textContent = document.documentElement.getAttribute('data-theme') === 'dark' ? '鈽€锔� 浜壊' : '馃寵 鏆楄壊';
+    document.getElementById('settingsOverlay').classList.add('show');
+  };
+  document.getElementById('btnSettingsCancel').onclick = () => document.getElementById('settingsOverlay').classList.remove('show');
+  document.getElementById('btnSettingsSave').onclick = () => {
+    const key = document.getElementById('apiKeyInput').value.trim(); if (key) saveApiKey(key);
+    setFeishuWebhookUrl(document.getElementById('feishuWebhookInput').value.trim());
+    const rv = document.getElementById('remindSetting').value, interval = rv === 'off' ? 0 : parseInt(rv);
+    setRemindInterval(interval); startReminderChecker(() => tasks);
+    document.getElementById('settingsOverlay').classList.remove('show'); showToast('鉁� 璁剧疆宸蹭繚瀛�');
+  };
+  document.getElementById('themeToggleBtn').onclick = () => {
+    const next = toggleTheme();
+    document.getElementById('themeToggleBtn').textContent = next === 'dark' ? '鈽€锔� 浜壊' : '馃寵 鏆楄壊';
+    showToast(next === 'dark' ? '馃寵 鏆楄壊妯″紡' : '鈽€锔� 浜壊妯″紡');
+  };
+
+  document.getElementById('btnExport').onclick = exportTasks;
+  document.getElementById('btnImport').onclick = () => document.getElementById('importFile').click();
+  document.getElementById('btnSeedData').onclick = () => { document.getElementById('settingsOverlay').classList.remove('show'); importSeedData(); };
+  document.getElementById('importFile').onchange = (e) => { if (e.target.files[0]) { importTasks(e.target.files[0]); e.target.value = ''; } document.getElementById('settingsOverlay').classList.remove('show'); };
+  document.getElementById('notifyEnable').onclick = async () => { const perm = await requestNotificationPermission(); if (perm === 'granted') showToast('馃敂 閫氱煡宸插紑鍚�'); };
+  document.getElementById('notifyPrompt').addEventListener('click', function(e) { if (e.target === this) this.classList.add('hidden'); });
+  document.querySelectorAll('.modal-overlay').forEach(ov => { ov.addEventListener('click', function(e) { if (e.target === this) this.classList.remove('show'); }); });
+  document.querySelectorAll('.nav-tab').forEach(tab => { tab.addEventListener('click', () => navigate(tab.dataset.view)); });
+
+  // Brand modal
+  document.getElementById('brandModalCancel').onclick = () => document.getElementById('brandModal').classList.remove('show');
+  document.getElementById('brandModalSave').onclick = async () => {
+    const name = document.getElementById('brandNameInput').value.trim();
+    if (!name) { showToast('鈿狅笍 璇疯緭鍏ュ搧鐗屽悕绉�'); return; }
+    await saveBrand(createBrand({ id: genId(), name, floor: document.getElementById('brandFloorInput').value.trim(), category: document.getElementById('brandCategoryInput').value.trim(), area: parseInt(document.getElementById('brandAreaInput').value) || 0, monthlyRent: parseInt(document.getElementById('brandRentInput').value) || 0, leaseStart: document.getElementById('brandLeaseStartInput').value || null, leaseEnd: document.getElementById('brandLeaseEndInput').value || null, contacts: [], notes: document.getElementById('brandNotesInput').value.trim() }));
+    document.getElementById('brandModal').classList.remove('show'); await refreshAll(); showToast('鉁� 鍝佺墝宸叉坊鍔�');
+  };
+
+  // Contract modal
+  document.getElementById('contractModalCancel').onclick = () => document.getElementById('contractModal').classList.remove('show');
+  document.getElementById('contractModalSave').onclick = async () => {
+    const title = document.getElementById('contractTitleInput').value.trim(), content = document.getElementById('contractContentInput').value.trim();
+    if (!title || !content) { showToast('鈿狅笍 璇峰～鍐欐爣棰樺拰鍐呭'); return; }
+    const brandName = document.getElementById('contractBrandInput').value.trim(), brand = brands.find(b => b.name === brandName);
+    await saveContract(createContractClause({ id: genId(), brandId: brand ? brand.id : '', brandName: brandName || '閫氱敤', title, content, category: document.getElementById('contractCategoryInput').value, tags: document.getElementById('contractTagsInput').value.split(',').map(s => s.trim()).filter(Boolean), sourceDoc: document.getElementById('contractSourceInput').value.trim() }));
+    document.getElementById('contractModal').classList.remove('show');
+    ['contractTitleInput', 'contractContentInput', 'contractBrandInput', 'contractTagsInput', 'contractSourceInput'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+    await refreshAll(); showToast('鉁� 鏉℃宸叉坊鍔�');
+  };
+
+  // Chat
+  document.getElementById('chatSendBtn').onclick = async () => { const input = document.getElementById('chatInput'), question = input.value.trim(); if (!question) return; input.value = ''; await askAIAboutContracts(question); };
+  document.getElementById('chatInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') document.getElementById('chatSendBtn').click(); });
+
+  // Keyboard shortcuts
+  document.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+    if ((e.ctrlKey || e.metaKey) && e.key === 'n') { e.preventDefault(); document.getElementById('modalOverlay').classList.add('show'); document.getElementById('taskInput').focus(); }
+    else if ((e.ctrlKey || e.metaKey) && e.key === 'f') { e.preventDefault(); document.getElementById('searchInput').focus(); }
+  });
+}
+
+// 鈹€鈹€鈹€ Boot 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+setUndoCallback(undoDelete);
+
+async function init() {
+  await openDB();
+  await migrateFromLocalStorage();
+  loadSettings();
+  tasks = await loadTasks(); brands = await loadBrands(); contracts = await loadContracts();
+  initTheme(); updateHeaderDate(); initRouter(); bindEvents();
+  onViewChange(handleViewChange);
+  updateStats(tasks); updateFilterBrands(tasks, setFilter);
+  renderTasks(tasks, { tab: currentTab, filter: currentFilter, query: searchQuery, onToggle: toggleTask, onDelete: deleteWithUndo, onDetail: showDetail });
+  await initNotifications();
+  if (getRemindInterval() || getFeishuWebhookUrl()) startReminderChecker(() => tasks);
+  await checkSharedContent();
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+
+init().catch(err => { console.error('[app] Init failed:', err); showToast('鈿狅笍 鍒濆鍖栧け璐ワ紝璇峰埛鏂伴〉闈�'); });
